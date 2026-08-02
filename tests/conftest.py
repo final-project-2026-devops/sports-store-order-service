@@ -1,42 +1,22 @@
 import os
 from datetime import datetime, timedelta, timezone
 
+os.environ.setdefault("DYNAMODB_TABLE_NAME", "test-table")
+os.environ.setdefault("AWS_REGION", "us-east-1")
 os.environ["JWT_SECRET"] = "test-secret"
 
 import jwt
 import pytest
+from unittest.mock import AsyncMock
 from fastapi.testclient import TestClient
 
+from database import get_db_table
 from main import app
 
-
-class AsyncCursor:
-    """Minimal async iterator for mocking Motor cursors (chainable skip/limit)."""
-
-    def __init__(self, items):
-        self.items = list(items)
-
-    def skip(self, _n):
-        return self
-
-    def limit(self, _n):
-        return self
-
-    def sort(self, *_args, **_kwargs):
-        return self
-
-    def __aiter__(self):
-        self._iter = iter(self.items)
-        return self
-
-    async def __anext__(self):
-        try:
-            return next(self._iter)
-        except StopIteration:
-            raise StopAsyncIteration
+DEFAULT_USER_ID = "9c858901-8a57-4791-81fe-4c455b099bc9"
 
 
-def make_token(user_id="507f1f77bcf86cd799439011", email="user@test.com",
+def make_token(user_id=DEFAULT_USER_ID, email="user@test.com",
                role="customer", expires_minutes=60):
     payload = {
         "sub": user_id,
@@ -48,8 +28,21 @@ def make_token(user_id="507f1f77bcf86cd799439011", email="user@test.com",
 
 
 @pytest.fixture
-def client():
-    return TestClient(app)
+def mock_table():
+    """AsyncMock standing in for the aioboto3 DynamoDB Table resource."""
+    return AsyncMock()
+
+
+@pytest.fixture
+def client(mock_table):
+    async def override_get_db_table():
+        yield mock_table
+
+    app.dependency_overrides[get_db_table] = override_get_db_table
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db_table, None)
 
 
 @pytest.fixture

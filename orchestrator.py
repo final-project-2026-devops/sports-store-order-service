@@ -1,12 +1,12 @@
 import logging
+import uuid
 from datetime import datetime, timezone
 from os import environ
 
 from fastapi import HTTPException
-from pymongo import ReturnDocument
 
 import clients
-from database import counters_collection, orders_collection
+from database import to_dynamo
 from models import ShippingAddress
 
 logger = logging.getLogger("order-service")
@@ -15,15 +15,21 @@ SHIPPING_FLAT_RATE = float(environ.get("SHIPPING_FLAT_RATE", "5.00"))
 FREE_SHIPPING_THRESHOLD = float(environ.get("FREE_SHIPPING_THRESHOLD", "100"))
 
 
-async def next_order_number() -> str:
+async def next_order_number(table) -> str:
     year = datetime.now(timezone.utc).year
-    counter = await counters_collection.find_one_and_update(
-        {"_id": f"orders-{year}"},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
+    # Single-table design: the per-year counter lives in the same table as
+    # orders, keyed by the sentinel order_id "COUNTER#<year>". ADD on a
+    # missing item creates it starting from 0, so this upserts and
+    # increments atomically in one call — equivalent to the old Mongo
+    # find_one_and_update(upsert=True).
+    resp = await table.update_item(
+        Key={"order_id": f"COUNTER#{year}"},
+        UpdateExpression="ADD seq :incr",
+        ExpressionAttributeValues={":incr": 1},
+        ReturnValues="UPDATED_NEW",
     )
-    return f"ORD-{year}-{counter['seq']:06d}"
+    seq = int(resp["Attributes"]["seq"])
+    return f"ORD-{year}-{seq:06d}"
 
 
 def build_pricing(items: list[dict]) -> dict:
@@ -38,7 +44,7 @@ def build_pricing(items: list[dict]) -> dict:
 
 
 async def checkout(
-    user: dict, token: str, shipping_address: ShippingAddress, card_number: str
+    table, user: dict, token: str, shipping_address: ShippingAddress, card_number: str
 ) -> dict:
     cart = await clients.get_cart(token)
     items = cart.get("items", [])
@@ -54,8 +60,10 @@ async def checkout(
             detail={"message": "Insufficient stock", "skus": short},
         )
 
-    order_number = await next_order_number()
+    order_number = await next_order_number(table)
+    order_id = str(uuid.uuid4())
     order = {
+        "order_id": order_id,
         "order_number": order_number,
         "user_id": user["sub"],
         "status": "pending",
@@ -63,10 +71,10 @@ async def checkout(
         "pricing": build_pricing(items),
         "shipping_address": shipping_address.model_dump(),
         "payment": None,
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    await orders_collection.insert_one(order)
+    await table.put_item(Item=to_dynamo(order))
 
     payment = await clients.charge(
         {
@@ -95,13 +103,17 @@ async def checkout(
         "payment_id": payment["payment_id"],
         "idempotency_key": order_number,
     }
-    order["updated_at"] = datetime.now(timezone.utc)
-    await orders_collection.update_one(
-        {"order_number": order_number},
-        {"$set": {
-            "status": new_status,
-            "payment": order["payment"],
-            "updated_at": order["updated_at"],
-        }},
+    order["updated_at"] = datetime.now(timezone.utc).isoformat()
+    # order_id was minted above during put_item, so the status update can key
+    # directly off it without needing to look order_number back up.
+    await table.update_item(
+        Key={"order_id": order_id},
+        UpdateExpression="SET #status = :status, payment = :payment, updated_at = :updated_at",
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues={
+            ":status": new_status,
+            ":payment": to_dynamo(order["payment"]),
+            ":updated_at": order["updated_at"],
+        },
     )
     return order

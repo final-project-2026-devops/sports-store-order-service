@@ -1,12 +1,14 @@
 import re
 from unittest.mock import AsyncMock, patch
 
-USER_ID = "507f1f77bcf86cd799439011"
+from tests.conftest import DEFAULT_USER_ID
+
+USER_ID = DEFAULT_USER_ID
 
 CART = {
     "items": [
         {
-            "product_id": "507f1f77bcf86cd799439021",
+            "product_id": "5f8d0d55-6f14-4d2a-9c1a-2c1e9b6b3a10",
             "sku": "VR-BLK-42",
             "name": "Velocity Runner",
             "size": "42",
@@ -31,15 +33,17 @@ CHECKOUT_PAYLOAD = {
 }
 
 
-def mock_db():
-    db = {
-        "orders": patch("orchestrator.orders_collection"),
-        "counters": patch("orchestrator.counters_collection"),
-    }
-    return db
+def make_update_item_side_effect(seq=123):
+    async def _update_item(**kwargs):
+        key = kwargs.get("Key", {})
+        if str(key.get("order_id", "")).startswith("COUNTER#"):
+            return {"Attributes": {"seq": seq}}
+        return {"Attributes": {}}
+
+    return _update_item
 
 
-def setup_mocks(mock_clients, mock_counters, mock_orders, payment_status="succeeded"):
+def setup_mocks(mock_clients, mock_table, payment_status="succeeded", seq=123):
     mock_clients.get_cart = AsyncMock(return_value=CART)
     mock_clients.check_stock = AsyncMock(
         return_value=[{"sku": "VR-BLK-42", "available": 15, "in_stock": True}]
@@ -49,16 +53,13 @@ def setup_mocks(mock_clients, mock_counters, mock_orders, payment_status="succee
     )
     mock_clients.decrement_stock = AsyncMock(return_value=True)
     mock_clients.clear_cart = AsyncMock()
-    mock_counters.find_one_and_update = AsyncMock(return_value={"seq": 123})
-    mock_orders.insert_one = AsyncMock()
-    mock_orders.update_one = AsyncMock()
+    mock_table.update_item = AsyncMock(side_effect=make_update_item_side_effect(seq))
+    mock_table.put_item = AsyncMock(return_value={})
 
 
-def test_checkout_happy_path(client, auth_headers):
-    with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection") as mock_counters, \
-         patch("orchestrator.orders_collection") as mock_orders:
-        setup_mocks(mock_clients, mock_counters, mock_orders)
+def test_checkout_happy_path(client, mock_table, auth_headers):
+    with patch("orchestrator.clients") as mock_clients:
+        setup_mocks(mock_clients, mock_table)
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
         )
@@ -81,14 +82,13 @@ def test_checkout_happy_path(client, auth_headers):
     charge_payload = mock_clients.charge.call_args.args[0]
     assert charge_payload["idempotency_key"] == body["order_number"]
     assert charge_payload["amount"] == 259.98
+    mock_table.put_item.assert_awaited_once()
+    assert mock_table.update_item.await_count == 2
 
 
-def test_checkout_payment_failure_402(client, auth_headers):
-    with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection") as mock_counters, \
-         patch("orchestrator.orders_collection") as mock_orders:
-        setup_mocks(mock_clients, mock_counters, mock_orders,
-                    payment_status="failed")
+def test_checkout_payment_failure_402(client, mock_table, auth_headers):
+    with patch("orchestrator.clients") as mock_clients:
+        setup_mocks(mock_clients, mock_table, payment_status="failed")
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
         )
@@ -99,47 +99,39 @@ def test_checkout_payment_failure_402(client, auth_headers):
     mock_clients.clear_cart.assert_not_awaited()
 
 
-def test_checkout_empty_cart_400(client, auth_headers):
-    with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection"), \
-         patch("orchestrator.orders_collection") as mock_orders:
+def test_checkout_empty_cart_400(client, mock_table, auth_headers):
+    with patch("orchestrator.clients") as mock_clients:
         mock_clients.get_cart = AsyncMock(return_value={"items": [], "subtotal": 0})
-        mock_orders.insert_one = AsyncMock()
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
         )
 
     assert response.status_code == 400
-    mock_orders.insert_one.assert_not_awaited()
+    mock_table.put_item.assert_not_awaited()
 
 
-def test_checkout_out_of_stock_409(client, auth_headers):
-    with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection"), \
-         patch("orchestrator.orders_collection") as mock_orders:
+def test_checkout_out_of_stock_409(client, mock_table, auth_headers):
+    with patch("orchestrator.clients") as mock_clients:
         mock_clients.get_cart = AsyncMock(return_value=CART)
         mock_clients.check_stock = AsyncMock(
             return_value=[{"sku": "VR-BLK-42", "available": 1, "in_stock": False}]
         )
-        mock_orders.insert_one = AsyncMock()
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
         )
 
     assert response.status_code == 409
     assert response.json()["detail"]["skus"] == ["VR-BLK-42"]
-    mock_orders.insert_one.assert_not_awaited()
+    mock_table.put_item.assert_not_awaited()
 
 
-def test_checkout_shipping_added_below_threshold(client, auth_headers):
+def test_checkout_shipping_added_below_threshold(client, mock_table, auth_headers):
     small_cart = {
         "items": [dict(CART["items"][0], quantity=1, unit_price=49.99)],
         "subtotal": 49.99,
     }
-    with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection") as mock_counters, \
-         patch("orchestrator.orders_collection") as mock_orders:
-        setup_mocks(mock_clients, mock_counters, mock_orders)
+    with patch("orchestrator.clients") as mock_clients:
+        setup_mocks(mock_clients, mock_table)
         mock_clients.get_cart = AsyncMock(return_value=small_cart)
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
