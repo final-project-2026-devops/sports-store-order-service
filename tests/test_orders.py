@@ -1,11 +1,12 @@
-from unittest.mock import AsyncMock
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
 
-from tests.conftest import DEFAULT_USER_ID, make_token
+from tests.conftest import AsyncCursor, make_token
 
-USER_ID = DEFAULT_USER_ID
+USER_ID = "507f1f77bcf86cd799439011"
 
 ORDER = {
-    "order_id": "0b0e5a6a-2f2b-4b0a-9c1a-2c1e9b6b3a11",
+    "_id": "abc",
     "order_number": "ORD-2026-000123",
     "user_id": USER_ID,
     "status": "paid",
@@ -17,74 +18,57 @@ ORDER = {
         "city": "Netanya", "postal_code": "1234567", "country": "Israel",
     },
     "payment": {"payment_id": "pay_123", "idempotency_key": "ORD-2026-000123"},
-    "created_at": "2026-07-18T00:00:00+00:00",
-    "updated_at": "2026-07-18T00:00:00+00:00",
+    "created_at": datetime(2026, 7, 18, tzinfo=timezone.utc),
 }
 
 
-def test_list_orders_own_history(client, mock_table, auth_headers):
-    mock_table.scan = AsyncMock(return_value={"Items": [dict(ORDER)]})
-    response = client.get("/api/orders", headers=auth_headers)
+def test_list_orders_own_history(client, auth_headers):
+    with patch("routes.orders.orders_collection") as mock_col:
+        mock_col.find.return_value = AsyncCursor([ORDER.copy()])
+        response = client.get("/api/orders", headers=auth_headers)
 
     assert response.status_code == 200
     body = response.json()
     assert len(body) == 1
     assert body[0]["order_number"] == "ORD-2026-000123"
     assert "_id" not in body[0]
-    scan_kwargs = mock_table.scan.call_args.kwargs
-    filter_expr = scan_kwargs["FilterExpression"]
-    attr, value = filter_expr._values
-    assert attr.name == "user_id"
-    assert value == USER_ID
+    query = mock_col.find.call_args.args[0]
+    assert query == {"user_id": USER_ID}
 
 
-def test_list_orders_paginates_scan(client, mock_table, auth_headers):
-    mock_table.scan = AsyncMock(
-        side_effect=[
-            {"Items": [dict(ORDER, order_number="ORD-2026-000001")],
-             "LastEvaluatedKey": {"order_id": "page-1"}},
-            {"Items": [dict(ORDER, order_number="ORD-2026-000002")]},
-        ]
-    )
-    response = client.get("/api/orders", headers=auth_headers)
-
-    assert response.status_code == 200
-    body = response.json()
-    assert {o["order_number"] for o in body} == {"ORD-2026-000001", "ORD-2026-000002"}
-    assert mock_table.scan.await_count == 2
-    second_call_kwargs = mock_table.scan.call_args_list[1].kwargs
-    assert second_call_kwargs["ExclusiveStartKey"] == {"order_id": "page-1"}
-
-
-def test_get_order_by_number(client, mock_table, auth_headers):
-    mock_table.scan = AsyncMock(return_value={"Items": [dict(ORDER)]})
-    response = client.get("/api/orders/ORD-2026-000123", headers=auth_headers)
+def test_get_order_by_number(client, auth_headers):
+    with patch("routes.orders.orders_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=ORDER.copy())
+        response = client.get("/api/orders/ORD-2026-000123", headers=auth_headers)
 
     assert response.status_code == 200
     assert response.json()["status"] == "paid"
 
 
-def test_get_foreign_order_404(client, mock_table):
-    other_user = make_token(user_id="4b6f0a0e-2b6b-4b0a-9c1a-2c1e9b6b3a99")
-    mock_table.scan = AsyncMock(return_value={"Items": [dict(ORDER)]})
-    response = client.get(
-        "/api/orders/ORD-2026-000123",
-        headers={"Authorization": f"Bearer {other_user}"},
-    )
+def test_get_foreign_order_404(client):
+    other_user = make_token(user_id="507f1f77bcf86cd799439099")
+    with patch("routes.orders.orders_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=ORDER.copy())
+        response = client.get(
+            "/api/orders/ORD-2026-000123",
+            headers={"Authorization": f"Bearer {other_user}"},
+        )
 
     assert response.status_code == 404
 
 
-def test_admin_can_view_any_order(client, mock_table, admin_headers):
-    mock_table.scan = AsyncMock(return_value={"Items": [dict(ORDER)]})
-    response = client.get("/api/orders/ORD-2026-000123", headers=admin_headers)
+def test_admin_can_view_any_order(client, admin_headers):
+    with patch("routes.orders.orders_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=ORDER.copy())
+        response = client.get("/api/orders/ORD-2026-000123", headers=admin_headers)
 
     assert response.status_code == 200
 
 
-def test_get_unknown_order_404(client, mock_table, auth_headers):
-    mock_table.scan = AsyncMock(return_value={"Items": []})
-    response = client.get("/api/orders/ORD-0000-000000", headers=auth_headers)
+def test_get_unknown_order_404(client, auth_headers):
+    with patch("routes.orders.orders_collection") as mock_col:
+        mock_col.find_one = AsyncMock(return_value=None)
+        response = client.get("/api/orders/ORD-0000-000000", headers=auth_headers)
 
     assert response.status_code == 404
 

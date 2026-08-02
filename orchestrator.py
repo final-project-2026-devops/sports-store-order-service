@@ -1,12 +1,12 @@
 import logging
-import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from os import environ
 
 from fastapi import HTTPException
 
 import clients
-from database import to_dynamo
+from database import orders_table
 from models import ShippingAddress
 
 logger = logging.getLogger("order-service")
@@ -15,21 +15,16 @@ SHIPPING_FLAT_RATE = float(environ.get("SHIPPING_FLAT_RATE", "5.00"))
 FREE_SHIPPING_THRESHOLD = float(environ.get("FREE_SHIPPING_THRESHOLD", "100"))
 
 
-async def next_order_number(table) -> str:
+def next_order_number() -> str:
     year = datetime.now(timezone.utc).year
-    # Single-table design: the per-year counter lives in the same table as
-    # orders, keyed by the sentinel order_id "COUNTER#<year>". ADD on a
-    # missing item creates it starting from 0, so this upserts and
-    # increments atomically in one call — equivalent to the old Mongo
-    # find_one_and_update(upsert=True).
-    resp = await table.update_item(
-        Key={"order_id": f"COUNTER#{year}"},
-        UpdateExpression="ADD seq :incr",
-        ExpressionAttributeValues={":incr": 1},
+    result = orders_table.update_item(
+        Key={"order_number": f"COUNTER#{year}"},
+        UpdateExpression="ADD seq :one",
+        ExpressionAttributeValues={":one": 1},
         ReturnValues="UPDATED_NEW",
     )
-    seq = int(resp["Attributes"]["seq"])
-    return f"ORD-{year}-{seq:06d}"
+    seq = int(result["Attributes"]["seq"])
+    return f"ORD-{seq:06d}"
 
 
 def build_pricing(items: list[dict]) -> dict:
@@ -43,8 +38,31 @@ def build_pricing(items: list[dict]) -> dict:
     }
 
 
+def _to_decimal(obj):
+    """Recursively convert floats to Decimal for DynamoDB storage."""
+    if isinstance(obj, list):
+        return [_to_decimal(i) for i in obj]
+    if isinstance(obj, dict):
+        return {k: _to_decimal(v) for k, v in obj.items()}
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    return obj
+
+
+def _from_decimal(obj):
+    """Recursively convert Decimal back to float/int for response serialisation."""
+    if isinstance(obj, list):
+        return [_from_decimal(i) for i in obj]
+    if isinstance(obj, dict):
+        return {k: _from_decimal(v) for k, v in obj.items()}
+    if isinstance(obj, Decimal):
+        f = float(obj)
+        return int(f) if f == int(f) else f
+    return obj
+
+
 async def checkout(
-    table, user: dict, token: str, shipping_address: ShippingAddress, card_number: str
+    user: dict, token: str, shipping_address: ShippingAddress, card_number: str
 ) -> dict:
     cart = await clients.get_cart(token)
     items = cart.get("items", [])
@@ -60,28 +78,27 @@ async def checkout(
             detail={"message": "Insufficient stock", "skus": short},
         )
 
-    order_number = await next_order_number(table)
-    order_id = str(uuid.uuid4())
+    order_number = next_order_number()
+    pricing = build_pricing(items)
     order = {
-        "order_id": order_id,
         "order_number": order_number,
         "user_id": user["sub"],
         "status": "pending",
         "items": items,
-        "pricing": build_pricing(items),
+        "pricing": pricing,
         "shipping_address": shipping_address.model_dump(),
         "payment": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    await table.put_item(Item=to_dynamo(order))
+    orders_table.put_item(Item=_to_decimal(order))
 
     payment = await clients.charge(
         {
             "idempotency_key": order_number,
             "order_number": order_number,
-            "amount": order["pricing"]["total"],
-            "currency": order["pricing"]["currency"],
+            "amount": pricing["total"],
+            "currency": pricing["currency"],
             "card_number": card_number,
         },
         token,
@@ -90,8 +107,6 @@ async def checkout(
     if payment["status"] == "succeeded":
         decremented = await clients.decrement_stock(stock_items, token)
         if not decremented:
-            # Paid but stock update failed — an accepted MVP gap; real systems
-            # reserve inventory before charging (see README Phase 2 exercises).
             logger.error("Stock decrement failed after payment for %s", order_number)
         await clients.clear_cart(token)
         new_status = "paid"
@@ -104,15 +119,14 @@ async def checkout(
         "idempotency_key": order_number,
     }
     order["updated_at"] = datetime.now(timezone.utc).isoformat()
-    # order_id was minted above during put_item, so the status update can key
-    # directly off it without needing to look order_number back up.
-    await table.update_item(
-        Key={"order_id": order_id},
-        UpdateExpression="SET #status = :status, payment = :payment, updated_at = :updated_at",
-        ExpressionAttributeNames={"#status": "status"},
+
+    orders_table.update_item(
+        Key={"order_number": order_number},
+        UpdateExpression="SET #s = :status, payment = :payment, updated_at = :updated_at",
+        ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={
             ":status": new_status,
-            ":payment": to_dynamo(order["payment"]),
+            ":payment": order["payment"],
             ":updated_at": order["updated_at"],
         },
     )
