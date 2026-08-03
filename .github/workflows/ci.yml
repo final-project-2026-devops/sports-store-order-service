@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-test-build:
+    name: Lint, test, build-validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q
+
+      - name: Build-validate image (no push)
+        run: docker build -t order-service:ci-validate .
+
+  publish:
+    name: Version bump + push to ECR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: lint-test-build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # for OIDC, once wired up
+      contents: write # to commit the VERSION bump
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump version + compute image tag
+        id: version
+        run: |
+          if [ ! -f VERSION ]; then echo "0.1.0" > VERSION; fi
+          CURRENT=$(cat VERSION)
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+          echo "$NEW" > VERSION
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          TAG="${NEW}-${SHORT_SHA}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "ci: bump version to $NEW [skip ci]"
+          git push
+
+      # --- Everything below is stubbed until Eli publishes the GitHub Actions
+      # OIDC role ARN (ROADMAP.md integration map: Eli -> Michael, Tuesday AM).
+      # This is intentional per Lab 01: "stub the main-push job if Eli's OIDC
+      # role isn't ready yet, finish it the moment it is." Never push :latest —
+      # the tag above is always <semver>-<7-char-hash>.
+      #
+      # - name: Configure AWS credentials (OIDC)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<OIDC_ROLE_NAME>
+      #     aws-region: us-east-1
+      #
+      # - name: Login to ECR
+      #   uses: aws-actions/amazon-ecr-login@v2
+      #
+      # - name: Build and push image
+      #   run: |
+      #     docker build -t $ECR_REGISTRY/order-service:${{ steps.version.outputs.tag }} .
+      #     docker push $ECR_REGISTRY/order-service:${{ steps.version.outputs.tag }}
+
+      - name: STUB - ECR push not wired yet
+        run: |
+          echo "Would push tag: ${{ steps.version.outputs.tag }}"
+          echo "Waiting on Eli's GitHub Actions OIDC role ARN before this can authenticate to AWS."
