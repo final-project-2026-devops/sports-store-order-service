@@ -1,0 +1,6 @@
+# FastAPI's `Depends(...)` as a default argument is the documented, correct
+# dependency-injection pattern - not the "function call in a default value"
+# antipattern flake8-bugbear's B008 rule is meant to catch. Without this,
+# ruff flags every FastAPI route/dependency signature in the codebase.
+[lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]
