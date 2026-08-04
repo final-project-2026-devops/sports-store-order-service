@@ -31,15 +31,7 @@ CHECKOUT_PAYLOAD = {
 }
 
 
-def mock_db():
-    db = {
-        "orders": patch("orchestrator.orders_collection"),
-        "counters": patch("orchestrator.counters_collection"),
-    }
-    return db
-
-
-def setup_mocks(mock_clients, mock_counters, mock_orders, payment_status="succeeded"):
+def setup_mocks(mock_clients, mock_orders_table, payment_status="succeeded"):
     mock_clients.get_cart = AsyncMock(return_value=CART)
     mock_clients.check_stock = AsyncMock(
         return_value=[{"sku": "VR-BLK-42", "available": 15, "in_stock": True}]
@@ -49,16 +41,14 @@ def setup_mocks(mock_clients, mock_counters, mock_orders, payment_status="succee
     )
     mock_clients.decrement_stock = AsyncMock(return_value=True)
     mock_clients.clear_cart = AsyncMock()
-    mock_counters.find_one_and_update = AsyncMock(return_value={"seq": 123})
-    mock_orders.insert_one = AsyncMock()
-    mock_orders.update_one = AsyncMock()
+    # orders_table is a real (synchronous) boto3 Table object in production.
+    mock_orders_table.update_item.return_value = {"Attributes": {"seq": 123}}
 
 
 def test_checkout_happy_path(client, auth_headers):
     with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection") as mock_counters, \
-         patch("orchestrator.orders_collection") as mock_orders:
-        setup_mocks(mock_clients, mock_counters, mock_orders)
+         patch("orchestrator.orders_table") as mock_orders_table:
+        setup_mocks(mock_clients, mock_orders_table)
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
         )
@@ -66,8 +56,8 @@ def test_checkout_happy_path(client, auth_headers):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "paid"
-    assert re.fullmatch(r"ORD-\d{4}-\d{6}", body["order_number"])
-    assert body["order_number"].endswith("000123")
+    assert re.fullmatch(r"ORD-\d{6}", body["order_number"])
+    assert body["order_number"] == "ORD-000123"
     # subtotal 259.98 > 100 → free shipping
     assert body["pricing"] == {
         "subtotal": 259.98,
@@ -81,14 +71,15 @@ def test_checkout_happy_path(client, auth_headers):
     charge_payload = mock_clients.charge.call_args.args[0]
     assert charge_payload["idempotency_key"] == body["order_number"]
     assert charge_payload["amount"] == 259.98
+    mock_orders_table.put_item.assert_called_once()
+    # once to allocate the order number, once to record the final status
+    assert mock_orders_table.update_item.call_count == 2
 
 
 def test_checkout_payment_failure_402(client, auth_headers):
     with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection") as mock_counters, \
-         patch("orchestrator.orders_collection") as mock_orders:
-        setup_mocks(mock_clients, mock_counters, mock_orders,
-                    payment_status="failed")
+         patch("orchestrator.orders_table") as mock_orders_table:
+        setup_mocks(mock_clients, mock_orders_table, payment_status="failed")
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
         )
@@ -101,34 +92,30 @@ def test_checkout_payment_failure_402(client, auth_headers):
 
 def test_checkout_empty_cart_400(client, auth_headers):
     with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection"), \
-         patch("orchestrator.orders_collection") as mock_orders:
+         patch("orchestrator.orders_table") as mock_orders_table:
         mock_clients.get_cart = AsyncMock(return_value={"items": [], "subtotal": 0})
-        mock_orders.insert_one = AsyncMock()
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
         )
 
     assert response.status_code == 400
-    mock_orders.insert_one.assert_not_awaited()
+    mock_orders_table.put_item.assert_not_called()
 
 
 def test_checkout_out_of_stock_409(client, auth_headers):
     with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection"), \
-         patch("orchestrator.orders_collection") as mock_orders:
+         patch("orchestrator.orders_table") as mock_orders_table:
         mock_clients.get_cart = AsyncMock(return_value=CART)
         mock_clients.check_stock = AsyncMock(
             return_value=[{"sku": "VR-BLK-42", "available": 1, "in_stock": False}]
         )
-        mock_orders.insert_one = AsyncMock()
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
         )
 
     assert response.status_code == 409
     assert response.json()["detail"]["skus"] == ["VR-BLK-42"]
-    mock_orders.insert_one.assert_not_awaited()
+    mock_orders_table.put_item.assert_not_called()
 
 
 def test_checkout_shipping_added_below_threshold(client, auth_headers):
@@ -137,9 +124,8 @@ def test_checkout_shipping_added_below_threshold(client, auth_headers):
         "subtotal": 49.99,
     }
     with patch("orchestrator.clients") as mock_clients, \
-         patch("orchestrator.counters_collection") as mock_counters, \
-         patch("orchestrator.orders_collection") as mock_orders:
-        setup_mocks(mock_clients, mock_counters, mock_orders)
+         patch("orchestrator.orders_table") as mock_orders_table:
+        setup_mocks(mock_clients, mock_orders_table)
         mock_clients.get_cart = AsyncMock(return_value=small_cart)
         response = client.post(
             "/api/orders/checkout", json=CHECKOUT_PAYLOAD, headers=auth_headers
