@@ -63,27 +63,18 @@ jobs:
           git commit -m "ci: bump version to $NEW [skip ci]"
           git push
 
-      # --- Everything below is stubbed until Eli publishes the GitHub Actions
-      # OIDC role ARN (ROADMAP.md integration map: Eli -> Michael, Tuesday AM).
-      # This is intentional per Lab 01: "stub the main-push job if Eli's OIDC
-      # role isn't ready yet, finish it the moment it is." Never push :latest —
-      # the tag above is always <semver>-<7-char-hash>.
-      #
-      # - name: Configure AWS credentials (OIDC)
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<OIDC_ROLE_NAME>
-      #     aws-region: us-east-1
-      #
-      # - name: Login to ECR
-      #   uses: aws-actions/amazon-ecr-login@v2
-      #
-      # - name: Build and push image
-      #   run: |
-      #     docker build -t $ECR_REGISTRY/order-service:${{ steps.version.outputs.tag }} .
-      #     docker push $ECR_REGISTRY/order-service:${{ steps.version.outputs.tag }}
+      # Never push :latest — the tag above is always <semver>-<7-char-hash>.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::977237815280:role/cloudcart-github-actions-cicd
+          aws-region: us-east-1
 
-      - name: STUB - ECR push not wired yet
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
         run: |
-          echo "Would push tag: ${{ steps.version.outputs.tag }}"
-          echo "Waiting on Eli's GitHub Actions OIDC role ARN before this can authenticate to AWS."
+          docker build -t ${{ steps.ecr-login.outputs.registry }}/sports-store-order-service:${{ steps.version.outputs.tag }} .
+          docker push ${{ steps.ecr-login.outputs.registry }}/sports-store-order-service:${{ steps.version.outputs.tag }}
